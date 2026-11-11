@@ -1,0 +1,197 @@
+<?php
+
+namespace App\Http\Controllers\Pegawai;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Storage;
+use Inertia\Inertia;
+
+class DashboardController extends Controller
+{
+    public function index()
+    {
+        $user = Auth::user()->load('employee');
+
+        if (!$user->employee) {
+            abort(404, 'Data pegawai tidak ditemukan.');
+        }
+
+        $employee = $user->employee;
+        $today = Carbon::today();
+
+        return Inertia::render('Auth/pegawai/Dashboard', [
+            'user' => $user,
+            // `photo_url` ditambahkan di sini (bukan cuma mengirim kolom
+            // `photo` mentah) supaya kartu profil di dashboard bisa
+            // langsung menampilkan foto asli pegawai, sama seperti foto
+            // di pojok kanan atas (avatar header) yang sudah lebih dulu
+            // pakai photo_url lewat HandleInertiaRequests.
+            'employee' => [
+                ...$employee->toArray(),
+                'photo_url' => $employee->photo ? Storage::url($employee->photo) : null,
+                // Status verifikasi wajah dihitung dari data asli: ada foto
+                // referensi = terverifikasi, tanggalnya dari kapan foto itu
+                // terakhir didaftarkan/diganti admin.
+                'face_verified' => (bool) $employee->photo,
+                'face_updated_label' => $employee->face_updated_at
+                    ? $employee->face_updated_at->locale('id')->translatedFormat('j M Y')
+                    : null,
+                'shift_details' => $employee->shiftDefinition(),
+            ],
+            'todayAttendance' => $this->formatTodayAttendance($employee),
+            'monthlySummary' => $this->buildMonthlySummary($employee, $today),
+            'recentActivities' => $this->buildRecentActivities($employee),
+        ]);
+    }
+
+    /**
+     * POST /pegawai/dashboard/alamat
+     * Reverse geocoding: ubah koordinat GPS pegawai jadi alamat teks
+     * (jalan, kelurahan, kecamatan, kota) lewat Nominatim/OpenStreetMap.
+     *
+     * Dipanggil dari server (bukan langsung dari browser) supaya:
+     * - User-Agent bisa diset sesuai aturan pemakaian Nominatim,
+     * - hasilnya bisa di-cache (koordinat dibulatkan ~11 meter) sehingga
+     *   tidak membanjiri layanan gratis tersebut.
+     *
+     * Kalau gagal, address = null dan dashboard menampilkan koordinat.
+     */
+    public function reverseGeocode(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'latitude' => ['required', 'numeric', 'between:-90,90'],
+            'longitude' => ['required', 'numeric', 'between:-180,180'],
+        ]);
+
+        $lat = round((float) $data['latitude'], 4);
+        $lng = round((float) $data['longitude'], 4);
+
+        $address = Cache::remember("revgeo_{$lat}_{$lng}", now()->addHours(6), function () use ($lat, $lng) {
+            try {
+                $response = Http::timeout(6)
+                    ->withHeaders([
+                        'User-Agent' => 'SIMABS-RSUD-Cibabat/1.0',
+                        'Accept-Language' => 'id',
+                    ])
+                    ->get('https://nominatim.openstreetmap.org/reverse', [
+                        'format' => 'jsonv2',
+                        'lat' => $lat,
+                        'lon' => $lng,
+                        'zoom' => 18,
+                        'addressdetails' => 1,
+                    ]);
+
+                if (!$response->successful()) {
+                    return null;
+                }
+
+                $json = $response->json();
+                $a = $json['address'] ?? [];
+
+                $jalan = trim(($a['road'] ?? '') . ' ' . ($a['house_number'] ?? ''));
+
+                $parts = array_values(array_unique(array_filter([
+                    $jalan,
+                    $a['village'] ?? $a['suburb'] ?? $a['neighbourhood'] ?? null,
+                    $a['city_district'] ?? null,
+                    $a['city'] ?? $a['town'] ?? $a['municipality'] ?? $a['county'] ?? null,
+                ])));
+
+                if (!empty($parts)) {
+                    return implode(', ', $parts);
+                }
+
+                return $json['display_name'] ?? null;
+            } catch (\Throwable $e) {
+                return null;
+            }
+        });
+
+        return response()->json([
+            'address' => $address,
+        ]);
+    }
+
+    /**
+     * Absensi hari ini pegawai yang login, buat kartu "Status Hari Ini" &
+     * "Jam Masuk". Null kalau belum absen sama sekali hari ini.
+     */
+    private function formatTodayAttendance($employee): ?array
+    {
+        $attendance = $employee->todayAttendance();
+
+        if (!$attendance) {
+            return null;
+        }
+
+        return [
+            'check_in_at' => $attendance->check_in_at?->format('H:i'),
+            'check_out_at' => $attendance->check_out_at?->format('H:i'),
+            'status' => $attendance->status,
+            'method' => $attendance->check_in_method,
+        ];
+    }
+
+    /**
+     * Ringkasan kehadiran bulan berjalan (kartu "Ringkasan Bulan" &
+     * "Kehadiran Bulan Ini"). Otomatis reset tiap awal bulan karena
+     * query-nya selalu dibatasi ke bulan & tahun HARI INI, jadi begitu
+     * tanggal 1 datang, otomatis dihitung dari 0 lagi.
+     */
+    private function buildMonthlySummary($employee, Carbon $today): array
+    {
+        $attendances = $employee->attendances()
+            ->whereYear('attendance_date', $today->year)
+            ->whereMonth('attendance_date', $today->month)
+            ->get();
+
+        $hadir = $attendances->where('status', 'hadir')->count();
+        $terlambat = $attendances->where('status', 'terlambat')->count();
+        $izin = $attendances->where('status', 'alternatif')->count();
+
+        // Jumlah hari yang sudah lewat di bulan ini, sampai hari ini (dipakai
+        // sebagai penyebut supaya "Tidak Hadir" & persentase masuk akal).
+        $hariBerjalan = $today->day;
+        $tidakHadir = max($hariBerjalan - ($hadir + $terlambat + $izin), 0);
+
+        $tingkatKehadiran = $hariBerjalan > 0
+            ? round((($hadir + $terlambat) / $hariBerjalan) * 100, 1)
+            : 0;
+
+        return [
+            'year' => $today->year,
+            'month' => $today->month,
+            'hadir' => $hadir,
+            'terlambat' => $terlambat,
+            'izin' => $izin,
+            'tidak_hadir' => $tidakHadir,
+            'hari_berjalan' => $hariBerjalan,
+            'tingkat_kehadiran' => $tingkatKehadiran,
+        ];
+    }
+
+    /**
+     * 5 aktivitas absensi terakhir buat kartu "Aktivitas Terkini".
+     */
+    private function buildRecentActivities($employee)
+    {
+        return $employee->attendances()
+            ->whereNotNull('check_in_at')
+            ->orderByDesc('attendance_date')
+            ->limit(5)
+            ->get()
+            ->map(fn ($attendance) => [
+                'attendance_date' => $attendance->attendance_date->toDateString(),
+                'check_in_at' => $attendance->check_in_at?->format('H:i'),
+                'method' => $attendance->check_in_method,
+                'status' => $attendance->status,
+            ])
+            ->values();
+    }
+}
